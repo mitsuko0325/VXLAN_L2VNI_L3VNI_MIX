@@ -1,0 +1,203 @@
+# https://kakkotetsu.hatenablog.com/entry/2017/09/12/000405
+
+---Underlay OSPF---
+conf t
+
+feature ospf
+
+router ospf 100
+  router-id 2.2.2.2
+
+interface lo 0
+  ip addr 2.2.2.2/32
+  ip router ospf 100 area 0
+  no shut
+
+
+interface eth 1/1
+  no switchport
+  ip addr 192.168.2.1/30
+  ip ospf network point-to-point
+  ip router ospf 100 area 0
+  no shut
+
+---Control Plane MP-BGP EVPN---
+
+conf t
+
+feature bgp
+nv overlay evpn
+
+# Update SourceはLo0を指定しておく（必須ではない？）
+# VXLANはBGPの拡張Communityを利用するため、send-community bothが必要
+router bgp 65001
+  neighbor 9.9.9.9
+    remote-as 65001
+    update-source lo 0
+    address-family l2vpn evpn
+      send-community both
+
+---Overlay VXLAN---
+
+feature vn-segment-vlan-based
+feature interface-vlan
+feature nv overlay
+
+!!!vlan 100用も同様に設定
+vlan 100
+  vn-segment 10100
+!!!
+vlan 200
+  vn-segment 10200
+vlan 300
+  vn-segment 10300
+
+vrf context vxlan-10300
+  vni 10300
+  rd auto
+  address-family ipv4 unicast
+    route-target both auto
+    route-target both auto evpn
+
+fabric forwarding anycast-gateway-mac 0000.2222.3333
+
+!!!VLAN 100用も追加設定
+interface Vlan100
+  no shutdown
+  vrf member vxlan-10300
+  no ip redirects
+  ip address 192.168.100.254/24
+  fabric forwarding mode anycast-gateway
+!!!
+
+interface vlan 200
+  vrf member vxlan-10300
+  ip addr 192.168.200.254/24
+  fabric forwarding mode anycast-gateway
+  no shut
+
+interface vlan 300
+  vrf member vxlan-10300
+  ip forward
+  no shut
+
+!!!10100も、l2 VNIとして設定
+evpn
+  vni 10100 l2
+    rd auto
+    route-target import auto
+    route-target export auto
+  vni 10200 l2
+    rd auto
+    route-target import auto
+    route-target export auto
+!!!
+
+interface lo 1
+  ip address 22.22.22.22/32
+  ip router ospf 100 area 0
+  no shut
+
+
+!!! vni 10100もL2 VNIとしてNVEに紐付け
+interface nve1
+  no shutdown
+  host-reachability protocol bgp
+  source-interface loopback1
+  member vni 10100
+    ingress-replication protocol bgp
+  member vni 10200
+    ingress-replication protocol bgp
+  member vni 10300 associate-vrf
+!!!
+
+!!!!!!
+この設定は不要
+これがなくても、BGP EVPNがIP-MACセットの情報を広報するので、ホスト単位での経路情報が乗る
+
+router bgp 65001
+  vrf vxlan-10300
+    address-family ipv4 unicast
+      network 192.168.200.0/24
+!!!!!
+
+---Hostとの接続設定---
+
+interface Ethernet1/2
+  switchport
+  switchport access vlan 100
+  no shutdown
+
+interface Ethernet1/3
+  switchport
+  switchport access vlan 200
+  no shutdown
+---
+
+n9k-02(config-router)# show ip route vrf vxlan-10300 
+IP Route Table for VRF "vxlan-10300"
+'*' denotes best ucast next-hop
+'**' denotes best mcast next-hop
+'[x/y]' denotes [preference/metric]
+'%<string>' in via output denotes VRF <string>
+
+192.168.100.0/24, ubest/mbest: 1/0, attached
+    *via 192.168.100.254, Vlan100, [0/0], 02:33:26, direct
+192.168.100.1/32, ubest/mbest: 1/0
+    *via 11.11.11.11%default, [200/0], 02:26:23, bgp-65001, internal, tag 65001,
+ segid: 10300 tunnelid: 0xb0b0b0b encap: VXLAN
+ 
+192.168.100.2/32, ubest/mbest: 1/0, attached
+    *via 192.168.100.2, Vlan100, [190/0], 01:53:01, hmm
+192.168.100.254/32, ubest/mbest: 1/0, attached
+    *via 192.168.100.254, Vlan100, [0/0], 02:33:26, local
+192.168.200.0/24, ubest/mbest: 1/0, attached
+    *via 192.168.200.254, Vlan200, [0/0], 03:09:00, direct
+192.168.200.1/32, ubest/mbest: 1/0, attached
+    *via 192.168.200.1, Vlan200, [190/0], 01:41:59, hmm
+192.168.200.254/32, ubest/mbest: 1/0, attached
+    *via 192.168.200.254, Vlan200, [0/0], 03:09:00, local
+
+n9k-02(config-router)# show bgp l2vpn evpn 
+BGP routing table information for VRF default, address family L2VPN EVPN
+BGP table version is 17, Local Router ID is 2.2.2.2
+Status: s-suppressed, x-deleted, S-stale, d-dampened, h-history, *-valid, >-best
+Path type: i-internal, e-external, c-confed, l-local, a-aggregate, r-redist, I-i
+njected
+Origin codes: i - IGP, e - EGP, ? - incomplete, | - multipath, & - backup, 2 - b
+est2
+
+   Network            Next Hop            Metric     LocPrf     Weight Path
+Route Distinguisher: 1.1.1.1:32867
+*>i[2]:[0]:[0]:[48]:[5254.0007.f9a0]:[0]:[0.0.0.0]/216
+                      11.11.11.11                       100          0 i
+*>i[2]:[0]:[0]:[48]:[5254.0007.f9a0]:[32]:[192.168.100.1]/272
+                      11.11.11.11                       100          0 i
+*>i[3]:[0]:[32]:[11.11.11.11]/88
+                      11.11.11.11                       100          0 i
+
+Route Distinguisher: 2.2.2.2:32867    (L2VNI 10100)
+*>l[2]:[0]:[0]:[48]:[5254.0003.3e7c]:[0]:[0.0.0.0]/216
+                      22.22.22.22                       100      32768 i
+*>i[2]:[0]:[0]:[48]:[5254.0007.f9a0]:[0]:[0.0.0.0]/216
+                      11.11.11.11                       100          0 i
+*>l[2]:[0]:[0]:[48]:[5254.0003.3e7c]:[32]:[192.168.100.2]/272
+                      22.22.22.22                       100      32768 i
+*>i[2]:[0]:[0]:[48]:[5254.0007.f9a0]:[32]:[192.168.100.1]/272
+                      11.11.11.11                       100          0 i
+*>i[3]:[0]:[32]:[11.11.11.11]/88
+                      11.11.11.11                       100          0 i
+*>l[3]:[0]:[32]:[22.22.22.22]/88
+                      22.22.22.22                       100      32768 i
+
+Route Distinguisher: 2.2.2.2:32967    (L2VNI 10200)
+*>l[2]:[0]:[0]:[48]:[5254.0009.e9ae]:[0]:[0.0.0.0]/216
+                      22.22.22.22                       100      32768 i
+*>l[2]:[0]:[0]:[48]:[5254.0009.e9ae]:[32]:[192.168.200.1]/272
+                      22.22.22.22                       100      32768 i
+*>l[3]:[0]:[32]:[22.22.22.22]/88
+                      22.22.22.22                       100      32768 i
+
+Route Distinguisher: 2.2.2.2:3    (L3VNI 10300)
+*>i[2]:[0]:[0]:[48]:[5254.0007.f9a0]:[32]:[192.168.100.1]/272
+                      11.11.11.11                       100          0 i

@@ -1,0 +1,271 @@
+# https://kakkotetsu.hatenablog.com/entry/2017/09/12/000405
+---Underlay OSPF---
+conf t
+
+feature ospf
+
+router ospf 100
+  router-id 1.1.1.1
+
+interface lo 0
+  ip addr 1.1.1.1/32
+  ip router ospf 100 area 0
+  no shut
+
+
+interface eth 1/1
+  no switchport
+  ip addr 192.168.1.1/30
+  ip ospf network point-to-point
+  ip router ospf 100 area 0
+  no shut
+
+---Control Plane MP-BGP EVPN---
+
+conf t
+
+feature bgp
+nv overlay evpn
+
+# Update SourceはLo0を指定しておく（必須ではない？）
+# VXLANはBGPの拡張Communityを利用するため、send-community bothが必要
+router bgp 65001
+  neighbor 9.9.9.9
+    remote-as 65001
+    update-source lo 0
+    address-family l2vpn evpn
+      send-community both
+
+
+---Overlay VXLAN---
+
+# Configuration Guide このGuideの通りに設定が進んでいる
+# https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus9000/sw/93x/vxlan/configuration/guide/b-cisco-nexus-9000-series-nx-os-vxlan-configuration-guide-93x/b-cisco-nexus-9000-series-nx-os-vxlan-configuration-guide-93x_chapter_0101.html
+
+
+# L2 VNIはVXLAN Switchingを行い、MAC Address TableをLookUpするため
+# L3 VNIはVXLAN Routingを行い、Routing TableをLookUpするために使用
+# すべてのLeafが,VRF毎に同じL3 VNIを持ち、その間でRoutingを行う
+
+# INE Workbook Symmetric IRBあたり
+# https://my.ine.com/Networking/courses/f2e7ffce/virtual-extensible-lan-vxlan-on-nexus-nx-os
+# https://www.cisco.com/c/en/us/products/collateral/switches/nexus-9000-series-switches/guide-c07-734107.html#_Toc444553364
+
+# L2 VNI 10100
+# L3 VNI 10300
+
+
+feature vn-segment-vlan-based
+feature interface-vlan
+feature nv overlay
+
+
+# vlanとVNIの紐づけ
+vlan 100
+  vn-segment 10100
+
+vlan 300
+  vn-segment 10300
+
+# L3 VNI(=に使うSVI)のために新しくVRFを作成 = Tenant VRF
+# このL3 VNIのVRFと、このL3 VNIを使ってRoutingさせるL2 VNI(=につかうSVI)を同じVRFに属させる
+
+# VRFとL3 VNIの紐づけ
+
+# route-target autoの場合の採番方法は上記のConfiguration Guideに記載あり
+# Communityではroute-targetは手動設定していたが、Documentにある通りautoで良い。なぜならすべてのLeafはIBGPで同じASNかつ同じL3 VNI Numberなので、同じRTが使われることになるから。
+# ↑ DocumentにAutoはIBGPのみで動作する、EBGPの場合は手動設定の必要があるとDocumentに記載あり
+
+# bothはimport/export両方、という意味
+
+# evpnがつかないとper-IP-VRF Prefixのimport/exportに使われ、evpnがつくとper-VRF prefixのそれに使われる
+# ↑ よくわからんがおまじないでいいか？
+
+vrf context vxlan-10300
+  vni 10300
+  rd auto
+  address-family ipv4 unicast
+    route-target both auto
+    route-target both auto evpn
+
+
+# Anycast Gatewayに使う仮想MACを設定
+fabric forwarding anycast-gateway-mac 0000.2222.3333
+
+# SVIを設定。これはNVEとして使われる
+# 第3オクテットをVLAN Numberと合わせる
+# fabric forwarding mode anycast-gatewayは、SVIとAnycast GatewayとそのMACアドレスと紐づけ
+
+# L2 VNI100は、L3 VNI300を使ってRoutingさせたいので、同じVRFに所属させる
+interface vlan 100
+  vrf member vxlan-10300
+  ip addr 192.168.100.254/24
+  fabric forwarding mode anycast-gateway
+  no shut
+
+# L3 VNIは、PacketをRoutingさせるだけでいいのでIP Addressは不要(ARP使わずMAC Addressはどうやって知らせるんだろうか？ 宛先IPはNVEのSource Loopbackになるはずだが)
+# Routing機能は必要なので、ip forwardを設定しRouting TableをLookUPさせる
+interface vlan 300
+  vrf member vxlan-10300
+  ip forward
+  no shut
+
+# EVPN(EVPN Virtuak Instance)関連の設定
+# L2 VNIをここで指定。逆にここで指定されなかったVNIはL3 VNI判定になる？
+# BGP EVPNでMAC Address情報(どのNVE背後にあるか？)を広報する。
+# rd, rtともにautoで良い。これもrtは同じL2 VNIを使う場合同じ値になるから
+
+#1回目はerrorになる？2回入れたら行ける。INEにもあった
+evpn
+  vni 10100 l2
+  rd auto
+  route-target both auto
+
+
+# VXLAN Encap用のlo1を作成
+
+interface lo 1
+  ip address 11.11.11.11/32
+  ip router ospf 100 area 0
+  no shut
+
+# NVE Interface(Network Virtual Edge) = VXLANのEncap, Decapを行うInterfaceの設定
+# host-reachability protocol bgp = VXLAN Control PlaneとしてMP-BGP EVPNを使う、という設定。おまじない
+# member vni 10100 = L2 VNIをNVEへ紐づけ、L2な
+# ingress-replication protocol bgp=bgpで各LeafのVTEPのListを作り、BUMトラフィックをReplicationさせる
+
+# member vni 10300 associate-vrf = NVE+L2 VNIとL3 VNIの紐づけ。associate-vrfはおまじない
+
+interface nve 1
+  source-interface lo 1
+  host-reachability protocol bgp
+  member vni 10100
+    ingress-replication protocol bgp
+  member vni 10300 associate-vrf
+  no shut
+
+
+
+!!!!!!
+この設定は不要
+これがなくても、BGP EVPNがIP-MACセットの情報を広報するので、ホスト単位での経路情報が乗る
+
+# MP-BGP EVPNでL2 VNI(=が紐付けられたSVIがもつPrefix)を広報
+router bgp 65001
+  vrf vxlan-10300
+    address-family ipv4 unicast
+      network 192.168.100.0/24
+!!!!!
+
+---Hostとの接続設定---
+
+interface eth 1/3
+  switchport access vlan 100
+  no shut
+
+---Host側の設定---
+sudo ip addr add 192.168.1.1/24 dev ens2
+sudo ip route add default via 192.168.1.254
+
+---疎通確認---
+
+100.2/32,200.1/32のホスト毎の情報が載るが、これはBGP EVPNによるもの
+
+100.2/32のsegidが10300=L3 VNIのものになっているがこれは正しい
+200.1/32は当然L3 VNIでEncapされる
+
+n9k-01(config)# show ip route vrf vxlan-10300 
+IP Route Table for VRF "vxlan-10300"
+'*' denotes best ucast next-hop
+'**' denotes best mcast next-hop
+'[x/y]' denotes [preference/metric]
+'%<string>' in via output denotes VRF <string>
+
+192.168.100.0/24, ubest/mbest: 1/0, attached
+    *via 192.168.100.254, Vlan100, [0/0], 03:03:18, direct
+192.168.100.1/32, ubest/mbest: 1/0, attached
+    *via 192.168.100.1, Vlan100, [190/0], 02:12:40, hmm
+192.168.100.2/32, ubest/mbest: 1/0
+    *via 22.22.22.22%default, [200/0], 01:39:18, bgp-65001, internal, tag 65001,
+ segid: 10300 tunnelid: 0x16161616 encap: VXLAN
+ 
+192.168.100.254/32, ubest/mbest: 1/0, attached
+    *via 192.168.100.254, Vlan100, [0/0], 03:03:18, local
+192.168.200.1/32, ubest/mbest: 1/0
+    *via 22.22.22.22%default, [200/0], 01:28:16, bgp-65001, internal, tag 65001,
+ segid: 10300 tunnelid: 0x16161616 encap: VXLAN
+ 
+n9k-01(config)# show bgp l2vpn evpn 
+BGP routing table information for VRF default, address family L2VPN EVPN
+BGP table version is 14, Local Router ID is 1.1.1.1
+Status: s-suppressed, x-deleted, S-stale, d-dampened, h-history, *-valid, >-best
+Path type: i-internal, e-external, c-confed, l-local, a-aggregate, r-redist, I-i
+njected
+Origin codes: i - IGP, e - EGP, ? - incomplete, | - multipath, & - backup, 2 - b
+est2
+
+   Network            Next Hop            Metric     LocPrf     Weight Path
+Route Distinguisher: 1.1.1.1:32867    (L2VNI 10100)
+*>i[2]:[0]:[0]:[48]:[5254.0003.3e7c]:[0]:[0.0.0.0]/216
+                      22.22.22.22                       100          0 i
+*>l[2]:[0]:[0]:[48]:[5254.0007.f9a0]:[0]:[0.0.0.0]/216
+                      11.11.11.11                       100      32768 i
+*>i[2]:[0]:[0]:[48]:[5254.0003.3e7c]:[32]:[192.168.100.2]/272
+                      22.22.22.22                       100          0 i
+*>l[2]:[0]:[0]:[48]:[5254.0007.f9a0]:[32]:[192.168.100.1]/272
+                      11.11.11.11                       100      32768 i
+*>l[3]:[0]:[32]:[11.11.11.11]/88
+                      11.11.11.11                       100      32768 i
+*>i[3]:[0]:[32]:[22.22.22.22]/88
+                      22.22.22.22                       100          0 i
+
+Route Distinguisher: 2.2.2.2:32867
+*>i[2]:[0]:[0]:[48]:[5254.0003.3e7c]:[0]:[0.0.0.0]/216
+                      22.22.22.22                       100          0 i
+*>i[2]:[0]:[0]:[48]:[5254.0003.3e7c]:[32]:[192.168.100.2]/272
+                      22.22.22.22                       100          0 i
+*>i[3]:[0]:[32]:[22.22.22.22]/88
+                      22.22.22.22                       100          0 i
+
+Route Distinguisher: 2.2.2.2:32967
+*>i[2]:[0]:[0]:[48]:[5254.0009.e9ae]:[32]:[192.168.200.1]/272
+                      22.22.22.22                       100          0 i
+
+Route Distinguisher: 1.1.1.1:3    (L3VNI 10300)
+*>i[2]:[0]:[0]:[48]:[5254.0003.3e7c]:[32]:[192.168.100.2]/272
+                      22.22.22.22                       100          0 i
+*>i[2]:[0]:[0]:[48]:[5254.0009.e9ae]:[32]:[192.168.200.1]/272
+                      22.22.22.22                       100          0 i
+
+
+cisco@ubuntu:~$ ping 192.168.100.2
+PING 192.168.100.2 (192.168.100.2) 56(84) bytes of data.
+64 bytes from 192.168.100.2: icmp_seq=1 ttl=64 time=17.7 ms
+64 bytes from 192.168.100.2: icmp_seq=2 ttl=64 time=19.7 ms
+64 bytes from 192.168.100.2: icmp_seq=3 ttl=64 time=16.2 ms
+^C
+--- 192.168.100.2 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2003ms
+rtt min/avg/max/mdev = 16.208/17.857/19.656/1.411 ms
+cisco@ubuntu:~$ ping 192.168.200.1
+PING 192.168.200.1 (192.168.200.1) 56(84) bytes of data.
+64 bytes from 192.168.200.1: icmp_seq=1 ttl=62 time=19.6 ms
+64 bytes from 192.168.200.1: icmp_seq=2 ttl=62 time=17.5 ms
+64 bytes from 192.168.200.1: icmp_seq=3 ttl=62 time=22.3 ms
+^C
+--- 192.168.200.1 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2002ms
+rtt min/avg/max/mdev = 17.510/19.798/22.281/1.952 ms
+cisco@ubuntu:~$ ip neigh 
+192.168.100.254 dev ens2 lladdr 00:00:22:22:33:33 REACHABLE
+192.168.100.2 dev ens2 lladdr 52:54:00:03:3e:7c REACHABLE
+
+
+100.2は同一Subnet=L2 Domainのため、ARP=BUMはIngress Replicationされホストまで届くため、ARP学習される
+200.1は別サブネットのため、当然ARPで学習はされない
+
+記事にある通り、同じSubnet100.2/24あての通信は、VNI 10100でEncapされる
+別のSubnetの200.1/24宛の通信は、VNI 10300でEncapされる
+
+VNIはVXLANのHeaderの中の1情報にすぎないので、IP Routingに影響は及ぼさない。ルーティングテーブル通りに転送される
+
